@@ -684,10 +684,14 @@ function buildFetchV2(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
   const plan = resolveFetchPlan(store, req);
   const pack = writePack(plan.entries);
   const parts: Buffer[] = [];
-  // acknowledgments
-  parts.push(encodePktLine('acknowledgments\n'));
-  parts.push(encodePktLine('NAK\n'));
-  parts.push(DELIM);
+  // The acknowledgments section is only sent when the client sent 'have'
+  // lines (protocol v2): a client that sent no haves expects the response to
+  // start with shallow-info or packfile, and real git aborts otherwise.
+  if (req.haves.length > 0) {
+    parts.push(encodePktLine('acknowledgments\n'));
+    parts.push(encodePktLine('NAK\n'));
+    parts.push(DELIM);
+  }
   // shallow-info
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     parts.push(encodePktLine('shallow-info\n'));
@@ -942,7 +946,16 @@ export async function handleGitHttp(
   }
   // git-receive-pack
   const result = handleReceivePack(ctx.store, repo, body);
-  sendBuffer(res, result.status, 'application/x-git-receive-pack-result', result.body, ctx.reqId());
+  // Real git (git-remote-http) reads the report-status response to EOF; it
+  // treats a kept-alive connection after a complete report as a hangup, so
+  // close this response's connection explicitly.
+  res.writeHead(result.status, {
+    'content-type': 'application/x-git-receive-pack-result',
+    'content-length': result.body.length,
+    'x-github-request-id': ctx.reqId(),
+    connection: 'close',
+  });
+  res.end(result.body);
   return true;
 }
 
@@ -1007,6 +1020,13 @@ export function handleReceivePack(
     reportLines.push(`unpack ${unpackDetail}\n`);
   }
   const report = encodePktLines(reportLines);
-  const bodyOut = Buffer.concat([sideband(report, 1), FLUSH]);
+  // Real git's send-pack reads the report through a sideband demultiplexer:
+  // the demuxer strips the band byte and hands the payload to a pkt-line
+  // reader, which expects the report to end with a flush packet INSIDE the
+  // band-1 payload (git-http-backend sends exactly this), and then a second
+  // flush terminating the sideband stream itself. Without the in-band flush
+  // the reader hits EOF and dies with "the remote end hung up unexpectedly";
+  // without the outer flush it hangs waiting for more sideband data.
+  const bodyOut = Buffer.concat([sideband(Buffer.concat([report, FLUSH]), 1), FLUSH]);
   return { status: 200, body: bodyOut };
 }
