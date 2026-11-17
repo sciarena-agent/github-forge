@@ -94,7 +94,7 @@ export function parseTag(data: Buffer): { object: string; type: string; tag: str
 /** Build raw tree objects for a flat tree: returns root tree sha and every object (tree+blob). */
 export function buildTreeObjects(files: Tree): { rootSha: string; objects: Map<string, { type: GitObjectType; data: Buffer }> } {
   interface Node {
-    files: Map<string, FileEntry>;
+    files: Map<string, string>;
     dirs: Map<string, Node>;
   }
   const root: Node = { files: new Map(), dirs: new Map() };
@@ -116,7 +116,7 @@ export function buildTreeObjects(files: Tree): { rootSha: string; objects: Map<s
   }
   const build = (node: Node): string => {
     const entries: { mode: string; name: string; sha: string }[] = [];
-    for (const [name, entry] of node.files) entries.push({ mode: '100644', name, sha: entry.blobSha });
+    for (const [name, sha] of node.files) entries.push({ mode: '100644', name, sha });
     for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, sha: build(child) });
     entries.sort((a, b) => {
       const an = a.mode === '40000' ? `${a.name}/` : a.name;
@@ -408,6 +408,26 @@ export class Store {
       if (rec === null) continue;
       for (const p of rec.parents) stack.push(p);
     }
+  }
+
+  /**
+   * True when `ancestor` is reachable from `descendant` via commit parents (or equal).
+   */
+  isAncestor(ancestor: string, descendant: string): boolean {
+    if (ancestor === descendant) return true;
+    const seen = new Set<string>();
+    const stack = [descendant];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const obj = this.objects.get(oid);
+      if (obj === undefined || obj.type !== 'commit') continue;
+      const { parents } = parseCommit(obj.data);
+      if (parents.includes(ancestor)) return true;
+      for (const p of parents) stack.push(p);
+    }
+    return false;
   }
 
   /**

@@ -4,6 +4,7 @@
 // Only the documents the suite sends are supported; unknown fields produce a
 // GraphQL errors array (HTTP 200), unknown repos produce data.repository=null.
 import { diffTrees, type IssueRec, type PullRec, type RepoRec, type Store } from './store.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 /* ------------------------------------------------------------------ */
 /* global IDs (opaque, stable): base64url of "Kind:..."                */
@@ -89,6 +90,14 @@ function tokenize(src: string): Token[] {
       i += 3;
       continue;
     }
+    if (ch === '$') {
+      const m = /^\$[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+      if (m !== null) {
+        tokens.push({ kind: 'var', value: m[0].slice(1) });
+        i += m[0].length;
+        continue;
+      }
+    }
     if ('{}()[]:!=$'.includes(ch)) {
       tokens.push({ kind: 'punct', value: ch });
       i += 1;
@@ -125,14 +134,6 @@ function tokenize(src: string): Token[] {
       i += m![0].length;
       continue;
     }
-    if (ch === '$') {
-      const m = /^\$[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
-      if (m !== null) {
-        tokens.push({ kind: 'var', value: m[0].slice(1) });
-        i += m[0].length;
-        continue;
-      }
-    }
     throw new Error(`unexpected character ${JSON.stringify(ch)} at ${i}`);
   }
   return tokens;
@@ -156,7 +157,10 @@ export interface OperationNode {
 
 class Parser {
   private pos = 0;
-  constructor(private tokens: Token[]) {}
+  private tokens: Token[];
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
 
   private peek(): Token | undefined {
     return this.tokens[this.pos];
@@ -505,7 +509,10 @@ function findRepoByGlobalId(store: Store, globalId: string): RepoRec | null {
 /* ------------------------------------------------------------------ */
 
 class Executor {
-  constructor(private store: Store) {}
+  private store: Store;
+  constructor(store: Store) {
+    this.store = store;
+  }
 
   executeOperation(op: OperationNode, variables: Record<string, unknown>): { data: Record<string, unknown> | null; errors: { message: string; path?: (string | number)[] }[] } {
     const root: Value = { __typename: 'Query' };
@@ -712,6 +719,20 @@ class Executor {
         if (name === 'body') return parent.body;
         return null;
       }
+      case 'CreateIssuePayload':
+      case 'CloseIssuePayload': {
+        return name === 'issue' ? parent.issue : null;
+      }
+      case 'CreatePullRequestPayload':
+      case 'MergePullRequestPayload': {
+        return name === 'pullRequest' ? parent.pullRequest : null;
+      }
+      case 'AddCommentPayload': {
+        return name === 'commentEdge' ? parent.commentEdge : null;
+      }
+      case 'IssueCommentEdge': {
+        return name === 'node' ? parent.node : null;
+      }
       case 'PageInfo': {
         if (name === 'hasNextPage') return parent.hasNextPage;
         if (name === 'endCursor') return parent.endCursor;
@@ -753,7 +774,7 @@ function executeMutation(store: Store, op: OperationNode, variables: Record<stri
         const input = args.input as { repositoryId: string; title: string; body?: string };
         const repo = findRepoByGlobalId(store, String(input.repositoryId));
         if (repo === null) throw new GraphQLError('Could not resolve to a Repository with the global id.', [key]);
-        const issue = store.createIssue(repo, { title: String(input.title), body: input.body === undefined ? '' : String(input.body), labels: [] });
+        const issue = store.createIssue(repo, String(input.title), input.body === undefined ? '' : String(input.body), []);
         payload = { __typename: 'CreateIssuePayload', issue: { __typename: 'Issue', repo, issue } } as Value;
       } else if (field.name === 'closeIssue') {
         const input = args.input as { issueId: string };
@@ -772,12 +793,7 @@ function executeMutation(store: Store, op: OperationNode, variables: Record<stri
         const input = args.input as { repositoryId: string; baseRefName: string; headRefName: string; title: string; body?: string };
         const repo = findRepoByGlobalId(store, String(input.repositoryId));
         if (repo === null) throw new GraphQLError('Could not resolve to a Repository with the global id.', [key]);
-        const pull = store.createPull(repo, {
-          title: String(input.title),
-          body: input.body === undefined ? '' : String(input.body),
-          head: String(input.headRefName),
-          base: String(input.baseRefName),
-        });
+        const pull = store.createPull(repo, String(input.title), input.body === undefined ? '' : String(input.body), String(input.headRefName), String(input.baseRefName));
         payload = { __typename: 'CreatePullRequestPayload', pullRequest: { __typename: 'PullRequest', repo, pull } } as Value;
       } else if (field.name === 'mergePullRequest') {
         const input = args.input as { pullRequestId: string };
@@ -832,8 +848,53 @@ function executeMutation(store: Store, op: OperationNode, variables: Record<stri
 }
 
 /* ------------------------------------------------------------------ */
-/* public entry point                                                  */
+/* HTTP glue — used by app.ts                                          */
 /* ------------------------------------------------------------------ */
+
+
+const JSON_TYPE = 'application/json; charset=utf-8';
+
+export interface GraphQLHttpContext {
+  store: Store;
+  token: string;
+  reqId: () => string;
+}
+
+export async function handleGraphQLHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: GraphQLHttpContext,
+): Promise<void> {
+  if ((req.method ?? 'GET') !== 'POST') {
+    const body = JSON.stringify({ message: 'Method Not Allowed' });
+    res.writeHead(405, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': ctx.reqId() });
+    res.end(body);
+    return;
+  }
+  if (ctx.token !== '' && req.headers.authorization !== `Bearer ${ctx.token}`) {
+    const body = JSON.stringify({ message: 'Bad credentials' });
+    res.writeHead(401, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': ctx.reqId() });
+    res.end(body);
+    return;
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString('utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    const body = JSON.stringify({ data: null, errors: [{ message: 'Request body is not valid JSON' }] });
+    res.writeHead(400, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': ctx.reqId() });
+    res.end(body);
+    return;
+  }
+  const result = executeGraphQL(ctx.store, parsed);
+  const body = JSON.stringify(result);
+  res.writeHead(200, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(body), 'x-github-request-id': ctx.reqId() });
+  res.end(body);
+}
+
 
 export interface GraphQLEnvelope {
   data: Record<string, unknown> | null;

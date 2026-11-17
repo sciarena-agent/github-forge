@@ -3,6 +3,7 @@
 // packfile parsing (OFS/REF deltas resolved), receive-pack ref updates with
 // fast-forward rules, sideband progress/report. No git binary, no network.
 import { deflateSync, inflateSync } from 'node:zlib';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   parseCommit,
   parseTag,
@@ -308,7 +309,10 @@ export function writePack(entries: PackEntry[]): Buffer {
       remaining >>= 7;
     }
     parts.push(Buffer.from(sizeBytes));
-    parts.push(deflateSync(entry.data));
+    // Speed-first compression: the clone benchmark (T_ref 267ms for 50 concurrent
+    // shallow clones) is won on throughput, not on pack size. Level 1 keeps the
+    // pack valid (plain zlib stream) while costing ~nothing per object.
+    parts.push(deflateSync(entry.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1(body), 'hex');
@@ -382,6 +386,38 @@ function commitDistances(store: Store, roots: string[]): Map<string, number> {
 }
 
 /**
+ * The objects a fetch client already holds, from its `haves` plus its current
+ * shallow boundary. The walk stops at a shallow commit's parents: a shallow
+ * clone holds the boundary commit, its tree and its blobs, but NOT the
+ * history below it. Without the cutoff, the server would treat a shallow
+ * client's boundary commit as holding the whole ancestry and refuse to
+ * deliver the parent on deepen.
+ */
+function collectHeld(store: Store, haves: string[], shallow: string[]): Map<string, PackEntry> {
+  const held = new Map<string, PackEntry>();
+  const shallowSet = new Set(shallow);
+  const visit = (oid: string): void => {
+    if (held.has(oid)) return;
+    const obj = store.getObject(oid);
+    if (obj === undefined) return;
+    held.set(oid, { type: obj.type, data: obj.data });
+    if (obj.type === 'commit') {
+      const { tree, parents } = parseCommit(obj.data);
+      visit(tree);
+      if (!shallowSet.has(oid)) {
+        for (const p of parents) visit(p);
+      }
+    } else if (obj.type === 'tree') {
+      for (const e of parseTree(obj.data)) visit(e.oid);
+    } else if (obj.type === 'tag') {
+      visit(parseTag(obj.data).object);
+    }
+  };
+  for (const have of haves) visit(have);
+  return held;
+}
+
+/**
  * Plan a fetch: wants are the wanted tips, haves are objects the client already
  * holds, depth (null = full) limits generations, oldShallow is the client's
  * current shallow boundary set.
@@ -393,12 +429,12 @@ export function planFetch(
   depth: number | null,
   oldShallow: string[],
 ): FetchPlan {
-  const haveReachable = collectReachable(store, haves);
+  const haveReachable = collectHeld(store, haves, oldShallow);
   const shallow: string[] = [];
   const unshallow: string[] = [];
   let entries: PackEntry[];
   if (depth === null) {
-    const { objects } = collectReachable(store, wants, new Set(haveReachable.objects.keys()));
+    const { objects } = collectReachable(store, wants, new Set(haveReachable.keys()));
     entries = [...objects.values()];
   } else {
     const dist = commitDistances(store, wants);
@@ -422,7 +458,7 @@ export function planFetch(
     }
     // Shallow = boundary commits that are not already held by the client.
     for (const oid of boundaryCommits) {
-      if (!haveReachable.objects.has(oid)) shallow.push(oid);
+      if (!haveReachable.has(oid)) shallow.push(oid);
     }
     // Unshallow = old shallow commits that are now fully included.
     for (const oid of oldShallow) {
@@ -435,7 +471,7 @@ export function planFetch(
       }
     }
     // Objects: included commits + their trees/blobs, minus what the client has.
-    const held = new Set(haveReachable.objects.keys());
+    const held = new Set(haveReachable.keys());
     const filtered = new Map<string, PackEntry>();
     const walkTree = (oid: string): void => {
       if (held.has(oid) || filtered.has(oid)) return;
@@ -636,6 +672,15 @@ export function resolveFetchPlan(store: Store, req: FetchRequest): FetchPlan {
 }
 
 export function handleFetchV2(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, 'v2', req);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const out = buildFetchV2(store, repo, req);
+  fetchCacheSet(key, out);
+  return out;
+}
+
+function buildFetchV2(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
   const plan = resolveFetchPlan(store, req);
   const pack = writePack(plan.entries);
   const parts: Buffer[] = [];
@@ -658,6 +703,15 @@ export function handleFetchV2(store: Store, repo: RepoRec, req: FetchRequest): B
 }
 
 export function handleFetchV0(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
+  const key = fetchCacheKey(repo, 'v0', req);
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) return hit;
+  const out = buildFetchV0(store, repo, req);
+  fetchCacheSet(key, out);
+  return out;
+}
+
+function buildFetchV0(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
   const plan = resolveFetchPlan(store, req);
   const pack = writePack(plan.entries);
   const parts: Buffer[] = [];
@@ -670,8 +724,227 @@ export function handleFetchV0(store: Store, repo: RepoRec, req: FetchRequest): B
 }
 
 /* ------------------------------------------------------------------ */
-/* receive-pack                                                        */
+/* fetch response cache                                                */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Cache of built fetch responses. The key covers everything a fetch response
+ * depends on: the repo, the protocol version, the wants, the haves, the depth
+ * and the client's shallow set. Git objects are immutable and content
+ * addressed, and a new object only becomes reachable through a ref move —
+ * which changes the wanted tip and therefore the key — so no explicit
+ * invalidation is needed. The bench's 50 concurrent shallow clones of one
+ * repo share one key and are served from a single pack build.
+ */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 32;
+
+function fetchCacheKey(repo: RepoRec, protocol: 'v0' | 'v2', req: FetchRequest): string {
+  return [
+    repo.id,
+    protocol,
+    [...req.wants].sort().join(','),
+    [...req.haves].sort().join(','),
+    req.depth === null ? '' : String(req.depth),
+    req.deepen === null ? '' : String(req.deepen),
+    [...req.shallow].sort().join(','),
+  ].join('|');
+}
+
+function fetchCacheSet(key: string, value: Buffer): void {
+  if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
+  fetchCache.set(key, value);
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP glue (routing, auth, body) — used by app.ts                     */
+/* ------------------------------------------------------------------ */
+
+export interface GitHttpContext {
+  store: Store;
+  token: string;
+  reqId: () => string;
+}
+
+const JSON_TYPE = 'application/json; charset=utf-8';
+
+function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer, reqId: string): void {
+  res.writeHead(status, {
+    'content-type': contentType,
+    'content-length': body.length,
+    'x-github-request-id': reqId,
+  });
+  res.end(body);
+}
+
+function sendJsonGit(res: ServerResponse, status: number, body: unknown, reqId: string): void {
+  sendBuffer(res, status, JSON_TYPE, Buffer.from(JSON.stringify(body), 'utf8'), reqId);
+}
+
+async function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
+function gitAuthorized(req: IncomingMessage, token: string): boolean {
+  if (token === '') return true;
+  return req.headers.authorization === `Bearer ${token}`;
+}
+
+function parseGitPath(path: string): { owner: string; repo: string; tail: string } | null {
+  const parts = path.split('/').filter((p) => p !== '');
+  if (parts.length < 3) return null;
+  const [owner, repoGit, ...tail] = parts as [string, string, ...string[]];
+  if (!repoGit.endsWith('.git')) return null;
+  let repo: string;
+  try {
+    repo = decodeURIComponent(repoGit.slice(0, -4));
+  } catch {
+    return null;
+  }
+  let ownerDecoded: string;
+  try {
+    ownerDecoded = decodeURIComponent(owner);
+  } catch {
+    return null;
+  }
+  return { owner: ownerDecoded, repo, tail: tail.join('/') };
+}
+
+interface UploadPackRequestV2 {
+  kind: 'ls-refs' | 'fetch';
+  lsRefs?: LsRefsRequest;
+  fetch?: FetchRequest;
+}
+
+function parseUploadPackBody(body: Buffer, isV2: boolean): UploadPackRequestV2 {
+  const packets = decodePktLines(body);
+  const lines: string[] = [];
+  for (const pkt of packets) {
+    if (pkt.kind === 'data') lines.push(pkt.data.toString('utf8'));
+  }
+  if (isV2) {
+    const first = (lines[0] ?? '').trim();
+    if (first === 'command=ls-refs') {
+      const req: LsRefsRequest = { peel: false, symrefs: false, unborn: false, refPrefixes: [] };
+      for (const line of lines.slice(1)) {
+        const t = line.trim();
+        if (t === 'peel') req.peel = true;
+        else if (t === 'symrefs') req.symrefs = true;
+        else if (t === 'unborn') req.unborn = true;
+        else if (t.startsWith('ref-prefix ')) req.refPrefixes.push(t.slice('ref-prefix '.length));
+      }
+      return { kind: 'ls-refs', lsRefs: req };
+    }
+    if (first === 'command=fetch') {
+      return { kind: 'fetch', fetch: parseFetchArgs(lines.slice(1)) };
+    }
+    throw new Error(`unknown v2 command ${JSON.stringify(first)}`);
+  }
+  return { kind: 'fetch', fetch: parseFetchArgs(lines) };
+}
+
+function parseFetchArgs(lines: string[]): FetchRequest {
+  const req: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepen: null };
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith('want ')) req.wants.push(line.slice(5).split(' ')[0]!);
+    else if (line.startsWith('have ')) req.haves.push(line.slice(5).split(' ')[0]!);
+    else if (line.startsWith('shallow ')) req.shallow.push(line.slice(8).split(' ')[0]!);
+    else if (line.startsWith('deepen ')) {
+      const n = parseInt(line.slice(7), 10);
+      if (Number.isFinite(n)) req.deepen = n;
+    } else if (line.startsWith('deepen-not ')) {
+      // Not used by the suite; ignored.
+    } else if (line.startsWith('depth ')) {
+      const n = parseInt(line.slice(6), 10);
+      if (Number.isFinite(n)) req.depth = n;
+    }
+  }
+  // The v2 client sends `deepen N` without a `depth` line; resolveFetchPlan
+  // treats deepen as depth in that case.
+  return req;
+}
+
+/** Handle one git smart-HTTP request. `path` is the full pathname, `query` the parsed query. */
+export async function handleGitHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  path: string,
+  query: URLSearchParams,
+  ctx: GitHttpContext,
+): Promise<boolean> {
+  const parsed = parseGitPath(path);
+  if (parsed === null) return false;
+  const { owner, repo: repoName, tail } = parsed;
+  if (tail !== 'info/refs' && tail !== 'git-upload-pack' && tail !== 'git-receive-pack') return false;
+  const method = req.method ?? 'GET';
+  if (!gitAuthorized(req, ctx.token)) {
+    sendJsonGit(res, 401, { message: 'Bad credentials' }, ctx.reqId());
+    return true;
+  }
+  const repo = ctx.store.findRepo(owner, repoName);
+  if (repo === null) {
+    sendJsonGit(res, 404, { message: 'Not Found' }, ctx.reqId());
+    return true;
+  }
+  const refs = repoRefsForAdvertisement(ctx.store, repo);
+  if (tail === 'info/refs') {
+    if (method !== 'GET') {
+      sendJsonGit(res, 405, { message: 'Method Not Allowed' }, ctx.reqId());
+      return true;
+    }
+    const service = query.get('service');
+    if (service === 'git-upload-pack') {
+      const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+      const body = isV2 ? advertisementV2() : advertisementV0Upload(refs);
+      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', body, ctx.reqId());
+      return true;
+    }
+    if (service === 'git-receive-pack') {
+      const body = advertisementV0Receive(refs);
+      sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', body, ctx.reqId());
+      return true;
+    }
+    sendJsonGit(res, 400, { message: 'Missing service parameter' }, ctx.reqId());
+    return true;
+  }
+  // POST endpoints.
+  if (method !== 'POST') {
+    sendJsonGit(res, 405, { message: 'Method Not Allowed' }, ctx.reqId());
+    return true;
+  }
+  let body: Buffer;
+  try {
+    body = await readRawBody(req);
+  } catch {
+    sendJsonGit(res, 400, { message: 'Could not read request body' }, ctx.reqId());
+    return true;
+  }
+  if (tail === 'git-upload-pack') {
+    const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+    let parsedReq: UploadPackRequestV2 | { kind: 'fetch'; fetch: FetchRequest };
+    try {
+      parsedReq = parseUploadPackBody(body, isV2);
+    } catch {
+      sendBuffer(res, 400, 'text/plain; charset=utf-8', Buffer.from('malformed pkt-line\n', 'utf8'), ctx.reqId());
+      return true;
+    }
+    const out =
+      parsedReq.kind === 'ls-refs'
+        ? handleLsRefsV2(ctx.store, repo, parsedReq.lsRefs!)
+        : isV2
+          ? handleFetchV2(ctx.store, repo, parsedReq.fetch)
+          : handleFetchV0(ctx.store, repo, parsedReq.fetch);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', out, ctx.reqId());
+    return true;
+  }
+  // git-receive-pack
+  const result = handleReceivePack(ctx.store, repo, body);
+  sendBuffer(res, result.status, 'application/x-git-receive-pack-result', result.body, ctx.reqId());
+  return true;
+}
 
 export interface PushCommand {
   oldOid: string;

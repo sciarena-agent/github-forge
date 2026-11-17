@@ -1,10 +1,12 @@
 // app.ts — the forge's HTTP server: /healthz (no auth), /api/v3/* (REST), /mcp (MCP),
-// and a JSON 404 for everything else (including the git smart-HTTP paths, which v1
-// does not serve yet). main.ts owns the lifecycle; this file owns the surface.
+// /api/graphql (GraphQL), and /{owner}/{repo}.git/* (git smart HTTP, v0 + v2).
+// main.ts owns the lifecycle; this file owns the surface.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Store } from './store.ts';
 import { handleRest, sendJson } from './rest.ts';
 import { handleMcp } from './mcp.ts';
+import { handleGitHttp } from './git.ts';
+import { handleGraphQLHttp } from './graphql.ts';
 
 const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW ?? '2026-01-01T00:00:00Z';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -61,7 +63,16 @@ export function createApp(): Server {
           await handleRest(req, res, path, queryOf(req), { store, token: TOKEN, reqId: idOf });
           return;
         }
-        // Everything else, every method: GitHub's 404 body (git smart HTTP is v2 scope).
+        // GraphQL endpoint.
+        if (rawPath === '/api/graphql' || rawPath === '/api/v3/graphql') {
+          await handleGraphQLHttp(req, res, { store, token: TOKEN, reqId: idOf });
+          return;
+        }
+        // Git smart HTTP: /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack.
+        if (await handleGitHttp(req, res, rawPath, queryOf(req), { store, token: TOKEN, reqId: idOf })) {
+          return;
+        }
+        // Everything else, every method: GitHub's 404 body.
         sendJson(res, 404, { message: 'Not Found' }, id);
       } catch (err) {
         try {
