@@ -1,89 +1,78 @@
-// app.ts — the forge's HTTP server: /healthz (no auth), /api/v3/* (REST), /mcp (MCP),
-// /api/graphql (GraphQL), and /{owner}/{repo}.git/* (git smart HTTP, v0 + v2).
-// main.ts owns the lifecycle; this file owns the surface.
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Store } from './store.ts';
-import { handleRest, sendJson } from './rest.ts';
-import { handleMcp } from './mcp.ts';
-import { handleGitHttp } from './git.ts';
-import { handleGraphQLHttp } from './graphql.ts';
+// app.ts — Node shim for the Go forge binary. main.ts owns the lifecycle;
+// this file only spawns ./forge, waits for its first stdout line "PORT <n>",
+// and exposes the four members main.ts uses: once('error'), listen(0, cb),
+// address(), close(). The Go binary owns the whole HTTP surface.
+import { EventEmitter } from 'node:events';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const TRIAL_NOW = process.env.MAKEFUN_TRIAL_NOW ?? '2026-01-01T00:00:00Z';
-const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+export class ForgeServer extends EventEmitter {
+  private child: ChildProcess | null = null;
+  private port: number | null = null;
+  private portSeen = false;
+  private stdoutBuf = '';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+  listen(port: number, cb?: () => void): this {
+    if (this.child !== null) throw new Error('forge server is already listening');
+    const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
+    const child = spawn(forgePath, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+    this.child = child;
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+    const fail = (err: Error): void => {
+      if (this.portSeen) return;
+      this.emit('error', err);
+    };
+    child.once('error', (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    child.once('exit', (code, signal) => {
+      if (!this.portSeen) {
+        fail(new Error(`forge exited before reporting a port (code=${code} signal=${signal})`));
+      }
+    });
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (this.portSeen) return; // drain only; the port line is already known
+      this.stdoutBuf += chunk.toString('utf8');
+      const nl = this.stdoutBuf.indexOf('\n');
+      if (nl < 0) return;
+      const line = this.stdoutBuf.slice(0, nl).trim();
+      const m = /^PORT (\d+)$/.exec(line);
+      if (!m) {
+        fail(new Error(`forge printed an unexpected first line: ${JSON.stringify(line)}`));
+        return;
+      }
+      this.port = Number(m[1]);
+      this.portSeen = true;
+      if (cb) cb();
+    });
+    return this;
   }
-}
 
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+  address(): { port: number } | null {
+    return this.port === null ? null : { port: this.port };
+  }
+
+  close(): this {
+    const child = this.child;
+    this.child = null;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Already gone; nothing left to do.
+      }
+      const t = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Already gone.
+        }
+      }, 500);
+      t.unref();
+    }
+    return this;
   }
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  const store = new Store(TRIAL_NOW);
-  let reqCounter = 0;
-  const reqId = (): string => {
-    reqCounter += 1;
-    return `req-${reqCounter}`;
-  };
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      // One id per request, minted once and reused by every reply (including the 500 path).
-      const id = reqId();
-      const idOf = (): string => id;
-      try {
-        const rawPath = pathOf(req);
-        const method = req.method ?? 'GET';
-        // Health probe: no auth.
-        if (method === 'GET' && rawPath === '/healthz') {
-          sendJson(res, 200, { ok: true }, id);
-          return;
-        }
-        // MCP endpoint.
-        if (rawPath === '/mcp') {
-          await handleMcp(req, res, { store, token: TOKEN, reqId: idOf });
-          return;
-        }
-        // REST v3 surface.
-        if (rawPath === '/api/v3' || rawPath.startsWith('/api/v3/')) {
-          const sub = rawPath === '/api/v3' ? '' : rawPath.slice('/api/v3'.length);
-          const path = sub.length > 1 && sub.endsWith('/') ? sub.slice(0, -1) : sub;
-          await handleRest(req, res, path, queryOf(req), { store, token: TOKEN, reqId: idOf });
-          return;
-        }
-        // GraphQL endpoint.
-        if (rawPath === '/api/graphql' || rawPath === '/api/v3/graphql') {
-          await handleGraphQLHttp(req, res, { store, token: TOKEN, reqId: idOf });
-          return;
-        }
-        // Git smart HTTP: /{owner}/{repo}.git/info/refs, git-upload-pack, git-receive-pack.
-        if (await handleGitHttp(req, res, rawPath, queryOf(req), { store, token: TOKEN, reqId: idOf })) {
-          return;
-        }
-        // Everything else, every method: GitHub's 404 body.
-        sendJson(res, 404, { message: 'Not Found' }, id);
-      } catch (err) {
-        try {
-          const text = JSON.stringify({ message: 'Internal Server Error' });
-          res.writeHead(500, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': id });
-          res.end(text);
-        } catch {
-          // The socket is already gone; nothing left to do.
-        }
-        process.stderr.write(`[app] unhandled: ${err instanceof Error ? err.message : String(err)}\n`);
-      }
-    })();
-  });
+export function createApp(): ForgeServer {
+  return new ForgeServer();
 }
