@@ -102,3 +102,4 @@ try {
   process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 }
+// Note: createApp in app.ts starts the Go core (a static ./forge binary) and proxies its port here.
