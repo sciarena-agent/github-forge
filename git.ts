@@ -687,9 +687,22 @@ function buildFetchV2(store: Store, repo: RepoRec, req: FetchRequest): Buffer {
   // The acknowledgments section is only sent when the client sent 'have'
   // lines (protocol v2): a client that sent no haves expects the response to
   // start with shallow-info or packfile, and real git aborts otherwise.
+  // `ready` closes the section: this server decides the whole pack from the
+  // single request, so negotiation is always over after the acks — without it
+  // real git refuses the packfile that follows ("expected no other sections
+  // to be sent after no 'ready'"). git-http-backend sends exactly this shape
+  // (ACKs for common haves, then `ready`, then the packfile section).
   if (req.haves.length > 0) {
     parts.push(encodePktLine('acknowledgments\n'));
-    parts.push(encodePktLine('NAK\n'));
+    let acked = false;
+    for (const have of req.haves) {
+      if (req.wants.some((want) => store.isAncestor(have, want))) {
+        parts.push(encodePktLine(`ACK ${have}\n`));
+        acked = true;
+      }
+    }
+    if (!acked) parts.push(encodePktLine('NAK\n'));
+    parts.push(encodePktLine('ready\n'));
     parts.push(DELIM);
   }
   // shallow-info
@@ -948,13 +961,19 @@ export async function handleGitHttp(
   const result = handleReceivePack(ctx.store, repo, body);
   // Real git (git-remote-http) reads the report-status response to EOF; it
   // treats a kept-alive connection after a complete report as a hangup, so
-  // close this response's connection explicitly.
-  res.writeHead(result.status, {
+  // close this response's connection explicitly — but only for real git
+  // (User-Agent `git/...`). Other clients (the kit's makefun-git-client/1.0)
+  // reuse connections, and closing every push forces a fresh TCP handshake
+  // per push (~1 connection per op in the bench).
+  const headers: Record<string, string | number> = {
     'content-type': 'application/x-git-receive-pack-result',
     'content-length': result.body.length,
     'x-github-request-id': ctx.reqId(),
-    connection: 'close',
-  });
+  };
+  if ((req.headers['user-agent'] ?? '').startsWith('git/')) {
+    headers['connection'] = 'close';
+  }
+  res.writeHead(result.status, headers);
   res.end(result.body);
   return true;
 }

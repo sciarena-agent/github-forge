@@ -404,6 +404,13 @@ export class Store {
       const oid = stack.pop()!;
       if (seen.has(oid)) continue;
       seen.add(oid);
+      // Ancestor-closed invariant: the only writers of repo.commits are
+      // makeCommit (whose parent was already in the map) and this walk itself
+      // (which processes a tip's whole ancestry), so a commit already in the
+      // map has its entire ancestry in the map too — stop the walk there.
+      // Without this, every push re-walked the whole branch history (O(chain)
+      // per push, O(n^2) over the bench's 200-push chain).
+      if (repo.commits.has(oid)) continue;
       const rec = this.materializeCommit(repo, oid);
       if (rec === null) continue;
       for (const p of rec.parents) stack.push(p);
